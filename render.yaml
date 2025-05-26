@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: yuyuyubbs-server     # Render上のサービス名
+    env: node             # 環境（Node.jsならnode）
+    plan: free            # プラン（無料プランとか）
+    buildCommand: npm install
+    startCommand: node server.js
+    branch: main          # Gitのブランチ指定
+    envVars:              # 環境変数設定（必要なら）
+      - key: NODE_ENV
+        value: production
