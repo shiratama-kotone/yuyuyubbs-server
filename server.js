@@ -22,7 +22,7 @@ const requestTimestamps = {};
 // 初期データ作成
 if (!fs.existsSync(DATA_FILE)) {
   const defaultData = {
-    topic: "初見さんいらっしゃい　",
+    topic: "初見さん、あなたはChatworkから来たでしょう。/ 使い方確認してね",
     posts: [],
   };
   fs.writeFileSync(DATA_FILE, JSON.stringify(defaultData, null, 2));
