@@ -1,195 +1,153 @@
+// server.js
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const bodyParser = require("body-parser");
 const crypto = require("crypto");
+const cors = require("cors");
+const axios = require("axios");
+const { v4: uuidv4 } = require("uuid");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, "data.json");
 const ID_FILE = path.join(__dirname, "ID.json");
-
-// 環境変数から運営用パスワードを取得
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
+app.use(cors());
 app.use(express.static("public"));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
-// 投稿制限のための変数
+// 投稿制限用
 const requestTimestamps = {};
 
-// 初期データ作成
-if (!fs.existsSync(DATA_FILE)) {
-  const defaultData = {
-    topic: "初見さん、あなたはChatworkから来たでしょう。/ 使い方確認してね",
-    posts: [],
-  };
-  fs.writeFileSync(DATA_FILE, JSON.stringify(defaultData, null, 2));
+
+
+// 投稿整理
+function prunePosts(jsonData) {
+  return new Promise((resolve, reject) => {
+    jsonData.posts = jsonData.posts.slice(-3);
+    fs.writeFile(DATA_FILE, JSON.stringify(jsonData, null, 2), (err) => {
+      if (err) return reject(err);
+      resolve(jsonData);
+    });
+  });
 }
 
-if (!fs.existsSync(ID_FILE)) {
-  const defaultIdData = {
-    example4: "defaultID",
-  };
-  fs.writeFileSync(ID_FILE, JSON.stringify(defaultIdData, null, 2));
-}
-
-// GET /api 投稿一覧返す
+// ----------------------
+// 掲示板API
+// ----------------------
 app.get("/api", (req, res) => {
   fs.readFile(DATA_FILE, "utf8", (err, data) => {
-    if (err) {
-      console.error(err);
-      return res.status(500).json({ error: "データの読み込みに失敗しました。" });
-    }
+    if (err) return res.status(500).json({ error: "データ読み込み失敗" });
     res.json(JSON.parse(data));
   });
 });
 
-// POST /api?name=&pass=&content= 新規投稿
-app.post("/api", (req, res) => {
-  const { name, pass, content } = req.query;
+app.post("/api", async (req, res) => {
+  // クエリパラメーターとJSONボディの両方をサポート
+  const { name, pass, content } = req.query.name ? req.query : req.body;
 
-  if (!name || !pass || !content) {
-    return res.status(400).json({ error: "すべてのフィールドを入力してください。" });
-  }
+  if (!name || !pass || !content) return res.status(400).json({ error: "全フィールド必須" });
 
-  // 投稿制限チェック
   const now = Date.now();
-  if (requestTimestamps[pass] && now - requestTimestamps[pass] < 1000) {
-    return res.status(429).json({ error: "同じパスワードでの投稿は1秒に1回までです。" });
-  }
+  if (requestTimestamps[pass] && now - requestTimestamps[pass] < 1000)
+    return res.status(429).json({ error: "同じパスワードで1秒に1回まで" });
 
-  // pass を SHA-256でハッシュ化して7文字切り出し + 先頭に @
-  const hashedId =
-    "@" +
-    crypto
-      .createHash("sha256")
-      .update(pass)
-      .digest("hex")
-      .substr(0, 7);
+  const hashedId = "@" + crypto.createHash("sha256").update(pass).digest("hex").substr(0, 7);
 
-  const newPost = {
-    name,
-    content,
-    id: hashedId,
-    time: new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" }), // JST固定
-  };
+  try {
+    let jsonData = JSON.parse(await fs.promises.readFile(DATA_FILE, "utf8"));
 
-  fs.readFile(DATA_FILE, "utf8", (err, data) => {
-    if (err) {
-      console.error(err);
-      return res.status(500).json({ error: "データの読み込みに失敗しました。" });
+    // nextPostNumberが存在しない場合は既存の投稿から最大番号を取得して初期化
+    if (typeof jsonData.nextPostNumber !== 'number') {
+      const maxNo = jsonData.posts.length > 0 ? Math.max(...jsonData.posts.map(post => post.no || 0)) : 0;
+      jsonData.nextPostNumber = maxNo + 1;
     }
 
-    const jsonData = JSON.parse(data);
-    jsonData.posts.unshift(newPost); // 新しい投稿は上に
-
-    if (jsonData.posts.length > 1000) {
-      jsonData.posts = jsonData.posts.slice(0, 1000);
-    }
-
-    // タイムスタンプを記録
-    requestTimestamps[pass] = now;
-
-    fs.writeFile(DATA_FILE, JSON.stringify(jsonData, null, 2), (err) => {
-      if (err) {
-        console.error(err);
-        return res.status(500).json({ error: "データの保存に失敗しました。" });
+    if (content === "/clear") {
+      const idJsonData = JSON.parse(await fs.promises.readFile(ID_FILE, "utf8"));
+      const isAdminId = Object.values(idJsonData).includes(hashedId);
+      if (isAdminId) {
+        jsonData.posts = [];
+        jsonData.nextPostNumber = 1; // 投稿番号もリセット
+        await fs.promises.writeFile(DATA_FILE, JSON.stringify(jsonData, null, 2));
+        return res.status(200).json({ message: "掲示板クリアされました" });
       }
-      res.status(200).json({ message: "投稿が成功しました。", post: newPost });
-    });
-  });
+    }
+
+    // 新しい投稿に番号を付与
+    const newPost = { 
+      no: jsonData.nextPostNumber,
+      name, 
+      content, 
+      id: hashedId, 
+      time: new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" }) 
+    };
+
+    jsonData.posts.unshift(newPost);
+    jsonData.nextPostNumber++; // 次の投稿番号をインクリメント
+
+    if (jsonData.posts.length > 200) await prunePosts(jsonData);
+    else await fs.promises.writeFile(DATA_FILE, JSON.stringify(jsonData, null, 2));
+
+    requestTimestamps[pass] = now;
+    res.status(200).json({ message: "投稿成功", post: newPost });
+  } catch (err) {
+    res.status(500).json({ error: "データ処理失敗" });
+  }
 });
 
-// POST /topic トピック変更API
 app.post("/topic", (req, res) => {
   const { topic, adminPassword } = req.body;
-
-  if (!topic) {
-    return res.status(400).json({ error: "トピックを入力してください。" });
-  }
-
-  if (adminPassword !== ADMIN_PASSWORD) {
-    return res.status(403).json({ error: "パスワードが正しくありません。" });
-  }
+  if (!topic) return res.status(400).json({ error: "トピック入力必須" });
+  if (adminPassword !== ADMIN_PASSWORD) return res.status(403).json({ error: "パスワード不正" });
 
   fs.readFile(DATA_FILE, "utf8", (err, data) => {
-    if (err) {
-      console.error(err);
-      return res.status(500).json({ error: "データの読み込みに失敗しました。" });
-    }
-
+    if (err) return res.status(500).json({ error: "データ読み込み失敗" });
     const jsonData = JSON.parse(data);
     jsonData.topic = topic;
-
     fs.writeFile(DATA_FILE, JSON.stringify(jsonData, null, 2), (err) => {
-      if (err) {
-        console.error(err);
-        return res.status(500).json({ error: "トピックの更新に失敗しました。" });
-      }
-      res.status(200).json({ message: "トピックが更新されました。" });
+      if (err) return res.status(500).json({ error: "トピック更新失敗" });
+      res.status(200).json({ message: "トピック更新完了" });
     });
   });
 });
-
 
 app.post("/delete", (req, res) => {
   const { postNumber, adminPassword } = req.body;
-
-  if (!postNumber || adminPassword !== ADMIN_PASSWORD) {
-    return res.status(403).json({ error: "パスワードが正しくないか、投稿番号が指定されていません。" });
-  }
+  if (!postNumber || adminPassword !== ADMIN_PASSWORD) return res.status(403).json({ error: "パスワード不正か投稿番号未指定" });
 
   fs.readFile(DATA_FILE, "utf8", (err, data) => {
-    if (err) {
-      console.error(err);
-      return res.status(500).json({ error: "データの読み込みに失敗しました。" });
-    }
-
+    if (err) return res.status(500).json({ error: "データ読み込み失敗" });
     const jsonData = JSON.parse(data);
+    const indexToDelete = postNumber - 1;
+    if (indexToDelete < 0 || indexToDelete >= jsonData.posts.length)
+      return res.status(404).json({ error: "投稿見つからず" });
 
-    // 投稿番号に対応するインデックスを正しく計算
-    const index = jsonData.posts.length - postNumber;
-
-    if (index < 0 || index >= jsonData.posts.length) {
-      return res.status(404).json({ error: "該当する投稿が見つかりません。" });
-    }
-
-    // 削除処理 → 内容・名前を「削除されました」にして、IDは空にする
-    jsonData.posts[index].name = "削除されました";
-    jsonData.posts[index].content = "削除されました";
-    jsonData.posts[index].id = "";
-
+    jsonData.posts[indexToDelete].name = "削除されました";
+    jsonData.posts[indexToDelete].content = "削除されました";
+    jsonData.posts[indexToDelete].id = "";
     fs.writeFile(DATA_FILE, JSON.stringify(jsonData, null, 2), (err) => {
-      if (err) {
-        console.error(err);
-        return res.status(500).json({ error: "データの保存に失敗しました。" });
-      }
-      res.status(200).json({ message: "投稿が削除されました。" });
+      if (err) return res.status(500).json({ error: "保存失敗" });
+      res.status(200).json({ message: "投稿削除完了" });
     });
   });
 });
 
-
-
-
-
-
-
-
-// GET /id ID取得API
 app.get("/id", (req, res) => {
   fs.readFile(ID_FILE, "utf8", (err, data) => {
-    if (err) {
-      console.error(err);
-      return res.status(500).json({ error: "IDデータの読み込みに失敗しました。" });
-    }
+    if (err) return res.status(500).json({ error: "ID読み込み失敗" });
     res.json(JSON.parse(data));
   });
 });
 
-// サーバー起動
-app.listen(PORT, () => {
-  console.log(`サーバーがポート ${PORT} で起動しました。`);
-});
+// ----------------------
+// ChatWork 全ルーム既読機能
+// ----------------------
+const cwJobs = {};
+
+app.post("/cw-read/start", async (req, res) => {
+  const { apiKey } = req.body;
+  if (!a
