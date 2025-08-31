@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: yuyuyubbs-server     # Render上のサービス名
+    name: yuyuyu-made-bbs-server     # Render上のサービス名
     env: node             # 環境（Node.jsならnode）
     plan: free            # プラン（無料プランとか）
     buildCommand: npm install
