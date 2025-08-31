@@ -150,4 +150,46 @@ const cwJobs = {};
 
 app.post("/cw-read/start", async (req, res) => {
   const { apiKey } = req.body;
-  if (!a
+  if (!apiKey) return res.status(400).json({ error: "APIキー必須" });
+
+  const jobId = uuidv4();
+  cwJobs[jobId] = { total: 0, done: 0, finished: false };
+
+  (async () => {
+    try {
+      const roomsRes = await axios.get("https://api.chatwork.com/v2/rooms", {
+        headers: { "X-ChatWorkToken": apiKey },
+      });
+      const rooms = roomsRes.data;
+      cwJobs[jobId].total = rooms.length;
+
+      let index = 0;
+      const interval = setInterval(async () => {
+        if (index >= rooms.length) { clearInterval(interval); cwJobs[jobId].finished = true; return; }
+        const room = rooms[index];
+        try {
+          await axios.put(`https://api.chatwork.com/v2/rooms/${room.room_id}/messages/read`, {}, {
+            headers: { "X-ChatWorkToken": apiKey }
+          });
+          cwJobs[jobId].done++;
+        } catch (err) { console.error(`既読失敗: ${room.name}`, err.response?.data || err.message); }
+        index++;
+      }, 1000);
+    } catch (err) { console.error("ルーム一覧取得失敗:", err.message); cwJobs[jobId].finished = true; }
+  })();
+
+  res.json({ jobId });
+});
+
+app.get("/cw-read/progress", (req, res) => {
+  const { jobId } = req.query;
+  if (!jobId || !cwJobs[jobId]) return res.status(404).json({ error: "ジョブ見つからず" });
+  res.json(cwJobs[jobId]);
+});
+
+// ----------------------
+// サーバー起動
+// ----------------------
+app.listen(PORT, () => {
+  console.log(`サーバーがポート ${PORT} で起動しました。`);
+});
