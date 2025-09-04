@@ -11,8 +11,16 @@ const { v4: uuidv4 } = require("uuid");
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, "data.json");
-const ID_FILE = path.join(__dirname, "ID.json");
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+
+// 管理者IDリスト（コード内に直接記述）
+const ADMIN_IDS = [
+  "@42d3e89",
+  "@9b0919e", 
+  "ざーこざーこばーかばーか",
+  "@9303157",
+  "@07fcc1a"
+];
 
 app.use(cors());
 app.use(express.static("public"));
@@ -21,6 +29,32 @@ app.use(bodyParser.json());
 
 // 投稿制限用
 const requestTimestamps = {};
+
+// 初期ファイル作成
+function initializeFiles() {
+  // data.jsonが存在しない場合は作成
+  if (!fs.existsSync(DATA_FILE)) {
+    const initialData = {
+      topic: "掲示板",
+      posts: [],
+      nextPostNumber: 1
+    };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(initialData, null, 2));
+    console.log("data.json を作成しました");
+  }
+}
+
+// 起動時にファイルを初期化
+initializeFiles();
+
+// ヘルスチェック用エンドポイント
+app.get("/", (req, res) => {
+  res.send("掲示板サーバーが正常に動作しています");
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "OK", timestamp: new Date().toISOString() });
+});
 
 
 
@@ -68,8 +102,7 @@ app.post("/api", async (req, res) => {
 
     // 全削除コマンド
     if (content === "/clear") {
-      const idJsonData = JSON.parse(await fs.promises.readFile(ID_FILE, "utf8"));
-      const isAdminId = Object.values(idJsonData).includes(hashedId);
+      const isAdminId = ADMIN_IDS.includes(hashedId);
       if (isAdminId) {
         jsonData.posts = [];
         jsonData.nextPostNumber = 1; // 投稿番号もリセット
@@ -82,8 +115,7 @@ app.post("/api", async (req, res) => {
     const deleteMatch = content.match(/^\/del\s+(\d+)$/);
     if (deleteMatch) {
       const postNumber = parseInt(deleteMatch[1]);
-      const idJsonData = JSON.parse(await fs.promises.readFile(ID_FILE, "utf8"));
-      const isAdminId = Object.values(idJsonData).includes(hashedId);
+      const isAdminId = ADMIN_IDS.includes(hashedId);
       
       if (isAdminId) {
         const postIndex = jsonData.posts.findIndex(post => post.no === postNumber);
@@ -105,8 +137,7 @@ app.post("/api", async (req, res) => {
     const topicMatch = content.match(/^\/topic\s+(.+)$/);
     if (topicMatch) {
       const newTopic = topicMatch[1];
-      const idJsonData = JSON.parse(await fs.promises.readFile(ID_FILE, "utf8"));
-      const isAdminId = Object.values(idJsonData).includes(hashedId);
+      const isAdminId = ADMIN_IDS.includes(hashedId);
       
       if (isAdminId) {
         jsonData.topic = newTopic;
@@ -177,10 +208,7 @@ app.post("/delete", (req, res) => {
 });
 
 app.get("/id", (req, res) => {
-  fs.readFile(ID_FILE, "utf8", (err, data) => {
-    if (err) return res.status(500).json({ error: "ID読み込み失敗" });
-    res.json(JSON.parse(data));
-  });
+  res.json(ADMIN_IDS);
 });
 
 // ----------------------
@@ -230,6 +258,6 @@ app.get("/cw-read/progress", (req, res) => {
 // ----------------------
 // サーバー起動
 // ----------------------
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`サーバーがポート ${PORT} で起動しました。`);
 });
