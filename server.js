@@ -66,6 +66,7 @@ app.post("/api", async (req, res) => {
       jsonData.nextPostNumber = maxNo + 1;
     }
 
+    // 全削除コマンド
     if (content === "/clear") {
       const idJsonData = JSON.parse(await fs.promises.readFile(ID_FILE, "utf8"));
       const isAdminId = Object.values(idJsonData).includes(hashedId);
@@ -74,6 +75,45 @@ app.post("/api", async (req, res) => {
         jsonData.nextPostNumber = 1; // 投稿番号もリセット
         await fs.promises.writeFile(DATA_FILE, JSON.stringify(jsonData, null, 2));
         return res.status(200).json({ message: "掲示板クリアされました" });
+      }
+    }
+
+    // 個別削除コマンド（/del 番号）
+    const deleteMatch = content.match(/^\/del\s+(\d+)$/);
+    if (deleteMatch) {
+      const postNumber = parseInt(deleteMatch[1]);
+      const idJsonData = JSON.parse(await fs.promises.readFile(ID_FILE, "utf8"));
+      const isAdminId = Object.values(idJsonData).includes(hashedId);
+      
+      if (isAdminId) {
+        const postIndex = jsonData.posts.findIndex(post => post.no === postNumber);
+        if (postIndex !== -1) {
+          jsonData.posts[postIndex].name = "削除されました";
+          jsonData.posts[postIndex].content = "削除されました";
+          jsonData.posts[postIndex].id = "";
+          await fs.promises.writeFile(DATA_FILE, JSON.stringify(jsonData, null, 2));
+          return res.status(200).json({ message: `投稿番号${postNumber}を削除しました` });
+        } else {
+          return res.status(404).json({ error: `投稿番号${postNumber}が見つかりません` });
+        }
+      } else {
+        return res.status(403).json({ error: "削除権限がありません" });
+      }
+    }
+
+    // トピック変更コマンド（/topic 新しいトピック）
+    const topicMatch = content.match(/^\/topic\s+(.+)$/);
+    if (topicMatch) {
+      const newTopic = topicMatch[1];
+      const idJsonData = JSON.parse(await fs.promises.readFile(ID_FILE, "utf8"));
+      const isAdminId = Object.values(idJsonData).includes(hashedId);
+      
+      if (isAdminId) {
+        jsonData.topic = newTopic;
+        await fs.promises.writeFile(DATA_FILE, JSON.stringify(jsonData, null, 2));
+        return res.status(200).json({ message: `トピックを「${newTopic}」に変更しました` });
+      } else {
+        return res.status(403).json({ error: "トピック変更権限がありません" });
       }
     }
 
