@@ -330,11 +330,13 @@ async function handlePost(table, topicKey, req, res) {
       commandMessage = "/stop";
     }
 
-    // /prohibit 分
-    const prohibitMatch = !commandMessage && content.match(/^\/prohibit\s+(\d+)$/);
-    if (prohibitMatch) {
+    // /prohibit 時間 (例: 3h, 5m, 2h30m)
+    const prohibitMatch = !commandMessage && content.match(/^\/prohibit\s+(\d+h)?(\d+m)?$/i);
+    if (prohibitMatch && (prohibitMatch[1] || prohibitMatch[2])) {
       if (role < 4) return res.status(403).json({ error: "権限不足 (運営のみ)" });
-      await setSetting("prohibit_until", String(Date.now() + parseInt(prohibitMatch[1]) * 60 * 1000));
+      const hours   = prohibitMatch[1] ? parseInt(prohibitMatch[1]) : 0;
+      const minutes = prohibitMatch[2] ? parseInt(prohibitMatch[2]) : 0;
+      await setSetting("prohibit_until", String(Date.now() + (hours * 60 + minutes) * 60 * 1000));
       commandMessage = "/prohibit";
     }
 
