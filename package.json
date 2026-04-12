@@ -1,6 +1,6 @@
 {
   "name": "keijiban",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "engines": {
     "node": "20.x"
   },
@@ -14,6 +14,7 @@
     "cors": "^2.8.5",
     "axios": "^1.7.0",
     "uuid": "^9.0.0"
+    "pg": "^8.13.3"
   },
   "main": "server.js",
   "keywords": [],
