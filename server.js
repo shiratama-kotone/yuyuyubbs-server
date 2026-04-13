@@ -274,11 +274,13 @@ async function handlePost(table, topicKey, req, res) {
       commandMessage = "/destroy";
     }
 
-    // /topic
-    const topicMatch = !commandMessage && content.match(/^\/topic\s+(.+)$/);
+    // /topic（複数行対応・最大10行・絵文字変換）
+    const topicMatch = !commandMessage && content.match(/^\/topic(?:\s+|\n)([\s\S]+)$/);
     if (topicMatch) {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
-      await setSetting(topicKey, topicMatch[1].trim());
+      const lines = topicMatch[1].split('\n').slice(0, 10);
+      const topicText = lines.join('\n').trim();
+      await setSetting(topicKey, topicText);
       commandMessage = "/topic";
     }
 
@@ -470,6 +472,20 @@ async function handlePost(table, topicKey, req, res) {
       commandMessage = "/instances";
     }
 
+    // /seedsearch（送信なし・権限別個数）
+    if (!commandMessage && content.trim() === "/seedsearch") {
+      if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
+      const count = role >= 4 ? 200 : role >= 3 ? 100 : 10;
+      const seeds = [];
+      for (let i = 0; i < count; i++) {
+        const seedPass = crypto.randomBytes(4).toString("hex");
+        const seedId = "@" + crypto.createHash("sha256").update(seedPass).digest("hex").substr(0, 7);
+        seeds.push({ pass: seedPass, id: seedId });
+      }
+      requestTimestamps[pass] = now;
+      return res.status(200).json({ message: "/seedsearch", seeds });
+    }
+
     // =====================
     // 通常投稿
     // =====================
@@ -558,6 +574,23 @@ app.post("/delete", async (req, res) => {
 app.get("/id", async (req, res) => {
   const { rows } = await pool.query(`SELECT id FROM admin`);
   res.json(rows.map(r => r.id));
+});
+
+// GET /seedsearch?pass=パスワード
+app.get("/seedsearch", async (req, res) => {
+  const { pass } = req.query;
+  if (!pass) return res.status(400).json({ error: "pass必須" });
+  const hashedId = "@" + crypto.createHash("sha256").update(pass).digest("hex").substr(0, 7);
+  const role = await getRole(hashedId);
+  if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
+  const count = role >= 4 ? 200 : role >= 3 ? 100 : 10;
+  const seeds = [];
+  for (let i = 0; i < count; i++) {
+    const seedPass = crypto.randomBytes(4).toString("hex");
+    const id = "@" + crypto.createHash("sha256").update(seedPass).digest("hex").substr(0, 7);
+    seeds.push({ pass: seedPass, id });
+  }
+  res.json({ seeds });
 });
 
 // ----------------------
