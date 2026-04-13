@@ -216,7 +216,7 @@ async function handlePost(table, topicKey, channel, req, res) {
   if (requestTimestamps[pass] && now - requestTimestamps[pass] < 1000)
     return res.status(429).json({ error: "同じパスワードで1秒に1回まで" });
 
-  const hashedId = "@" + crypto.createHash("sha256").update(pass).digest("hex").substr(0, 7);
+  const hashedId = "@" + crypto.createHash("sha256").update(pass).digest("base64").replace(/[^A-Za-z0-9]/g, "").substr(0, 7);
 
   try {
     const role = await getRole(hashedId);
@@ -495,7 +495,7 @@ async function handlePost(table, topicKey, channel, req, res) {
       const seeds = [];
       for (let i = 0; i < count; i++) {
         const seedPass = crypto.randomBytes(4).toString("hex");
-        const seedId = "@" + crypto.createHash("sha256").update(seedPass).digest("hex").substr(0, 7);
+        const seedId = "@" + crypto.createHash("sha256").update(seedPass).digest("base64").replace(/[^A-Za-z0-9]/g, "").substr(0, 7);
         seeds.push({ pass: seedPass, id: seedId });
       }
       requestTimestamps[pass] = now;
@@ -583,14 +583,14 @@ app.get("/id", async (req, res) => {
 app.get("/seedsearch", async (req, res) => {
   const { pass } = req.query;
   if (!pass) return res.status(400).json({ error: "pass必須" });
-  const hashedId = "@" + crypto.createHash("sha256").update(pass).digest("hex").substr(0, 7);
+  const hashedId = "@" + crypto.createHash("sha256").update(pass).digest("base64").replace(/[^A-Za-z0-9]/g, "").substr(0, 7);
   const role = await getRole(hashedId);
   if (role < 2) return res.status(403).json({ error: "権限不足" });
   const count = role >= 4 ? 200 : role >= 3 ? 100 : 10;
   const seeds = [];
   for (let i = 0; i < count; i++) {
     const seedPass = crypto.randomBytes(4).toString("hex");
-    const id = "@" + crypto.createHash("sha256").update(seedPass).digest("hex").substr(0, 7);
+    const id = "@" + crypto.createHash("sha256").update(seedPass).digest("base64").replace(/[^A-Za-z0-9]/g, "").substr(0, 7);
     seeds.push({ pass: seedPass, id });
   }
   res.json({ seeds });
