@@ -1,5 +1,7 @@
 // server.js
 const express = require("express");
+const http = require("http");
+const { WebSocketServer } = require("ws");
 const bodyParser = require("body-parser");
 const crypto = require("crypto");
 const cors = require("cors");
@@ -8,6 +10,8 @@ const { v4: uuidv4 } = require("uuid");
 const { Pool } = require("pg");
 
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
@@ -24,12 +28,26 @@ app.use(bodyParser.json());
 const requestTimestamps = {};
 
 // ----------------------
+// WebSocket ブロードキャスト
+// ----------------------
+// channel: 'chat' | 'battle'
+function broadcast(channel, data) {
+  const msg = JSON.stringify({ channel, ...data });
+  wss.clients.forEach(client => {
+    if (client.readyState === 1) client.send(msg);
+  });
+}
+
+wss.on("connection", (ws) => {
+  ws.on("error", console.error);
+});
+
+// ----------------------
 // DB初期化
 // ----------------------
 async function initDB() {
   const client = await pool.connect();
   try {
-    // 雑談投稿テーブル
     await client.query(`
       CREATE TABLE IF NOT EXISTS posts (
         no SERIAL PRIMARY KEY,
@@ -40,7 +58,6 @@ async function initDB() {
         deleted BOOLEAN DEFAULT FALSE
       )
     `);
-    // バトルスタジアム投稿テーブル
     await client.query(`
       CREATE TABLE IF NOT EXISTS battle_posts (
         no SERIAL PRIMARY KEY,
@@ -51,15 +68,12 @@ async function initDB() {
         deleted BOOLEAN DEFAULT FALSE
       )
     `);
-    // 権限テーブル（共通）
     await client.query(`CREATE TABLE IF NOT EXISTS admin   (id TEXT PRIMARY KEY)`);
     await client.query(`CREATE TABLE IF NOT EXISTS summit  (id TEXT PRIMARY KEY)`);
     await client.query(`CREATE TABLE IF NOT EXISTS manager (id TEXT PRIMARY KEY)`);
     await client.query(`CREATE TABLE IF NOT EXISTS speaker (id TEXT PRIMARY KEY)`);
-    // 装飾テーブル（共通）
     await client.query(`CREATE TABLE IF NOT EXISTS color (id TEXT PRIMARY KEY, color_code TEXT NOT NULL)`);
     await client.query(`CREATE TABLE IF NOT EXISTS "add" (id TEXT PRIMARY KEY, suffix TEXT NOT NULL)`);
-    // 設定テーブル
     await client.query(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
     await client.query(`
       INSERT INTO settings (key, value) VALUES
@@ -71,7 +85,6 @@ async function initDB() {
         ('prohibit_until', '0')
       ON CONFLICT (key) DO NOTHING
     `);
-    // 規制テーブル
     await client.query(`CREATE TABLE IF NOT EXISTS ng_words  (word TEXT PRIMARY KEY)`);
     await client.query(`CREATE TABLE IF NOT EXISTS ban       (id TEXT PRIMARY KEY)`);
     await client.query(`CREATE TABLE IF NOT EXISTS kill_list (id TEXT PRIMARY KEY)`);
@@ -91,6 +104,13 @@ async function initDB() {
         true
       )
     `);
+
+    // 起動通知（雑談のみ）
+    const bootTime = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
+    await client.query(
+      `INSERT INTO posts (name, id, content, time) VALUES ('さーばー', '( ᐛ )', 'サーバーが再起動しました', $1)`,
+      [bootTime]
+    );
 
     console.log("DBを初期化しました");
   } finally {
@@ -125,7 +145,6 @@ async function setSetting(key, value) {
   );
 }
 
-// 規制状態をまとめて返す
 async function getRestrictionStatus() {
   const prevent       = await getSetting("prevent");
   const restrict      = await getSetting("restrict");
@@ -133,9 +152,9 @@ async function getRestrictionStatus() {
   const prohibitUntil = parseInt(await getSetting("prohibit_until") ?? "0");
   const now = Date.now();
   return {
-    prevent:       prevent === "true",
-    restrict:      restrict === "true",
-    stopActive:    now < stopUntil,
+    prevent:        prevent === "true",
+    restrict:       restrict === "true",
+    stopActive:     now < stopUntil,
     stopUntil,
     prohibitActive: now < prohibitUntil,
     prohibitUntil,
@@ -160,7 +179,6 @@ async function pruneIfNeeded(table) {
   const { rows } = await pool.query(`SELECT COUNT(*) AS cnt FROM ${table}`);
   if (parseInt(rows[0].cnt) >= 1000) {
     await pool.query(`DELETE FROM ${table} WHERE no > 2`);
-    console.log(`${table}: 1000件到達 no=0〜2以外をリセット`);
   }
 }
 
@@ -171,7 +189,7 @@ app.get("/",       (req, res) => res.send("掲示板サーバーが正常に動�
 app.get("/health", (req, res) => res.status(200).json({ status: "OK", timestamp: new Date().toISOString() }));
 
 // ----------------------
-// 共通投稿取得ロジック
+// 共通GET
 // ----------------------
 async function handleGet(table, topicKey, res) {
   try {
@@ -187,9 +205,9 @@ async function handleGet(table, topicKey, res) {
 }
 
 // ----------------------
-// 共通投稿処理ロジック
+// 共通POST
 // ----------------------
-async function handlePost(table, topicKey, req, res) {
+async function handlePost(table, topicKey, channel, req, res) {
   const { name, pass, content } = req.query.name ? req.query : req.body;
   if (!name || !pass || !content)
     return res.status(400).json({ error: "全フィールド必須" });
@@ -203,7 +221,6 @@ async function handlePost(table, topicKey, req, res) {
   try {
     const role = await getRole(hashedId);
 
-    // kill確認
     const { rows: killRows } = await pool.query(`SELECT 1 FROM kill_list WHERE id=$1`, [hashedId]);
     if (killRows.length)
       return res.status(403).json({ error: "このアカウントは使用停止中です" });
@@ -222,10 +239,11 @@ async function handlePost(table, topicKey, req, res) {
         ON CONFLICT (no) DO NOTHING
       `);
       await pool.query(`SELECT setval(pg_get_serial_sequence('${table}','no'), 2, true)`);
+      broadcast(channel, { type: "clear" });
       commandMessage = "/clear";
     }
 
-    // /del 番号 [番号...]
+    // /del
     const delMatch = !commandMessage && content.match(/^\/del\s+([\d\s]+)$/);
     if (delMatch) {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
@@ -236,10 +254,11 @@ async function handlePost(table, topicKey, req, res) {
           [no]
         );
       }
+      broadcast(channel, { type: "delete", nos });
       commandMessage = "/del";
     }
 
-    // /destroy 文字列/color [...]
+    // /destroy
     const destroyMatch = !commandMessage && content.match(/^\/destroy\s+(.+)$/);
     if (destroyMatch) {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
@@ -271,36 +290,34 @@ async function handlePost(table, topicKey, req, res) {
           );
         }
       }
+      broadcast(channel, { type: "destroy" });
       commandMessage = "/destroy";
     }
 
-    // /topic（複数行対応・最大10行・絵文字変換）
+    // /topic（複数行・最大10行）
     const topicMatch = !commandMessage && content.match(/^\/topic(?:\s+|\n)([\s\S]+)$/);
     if (topicMatch) {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
       const lines = topicMatch[1].split('\n').slice(0, 10);
-      const topicText = lines.join('\n').trim();
-      await setSetting(topicKey, topicText);
+      await setSetting(topicKey, lines.join('\n').trim());
       commandMessage = "/topic";
     }
 
-    // /NG 言葉 [...]
+    // /NG
     const ngMatch = !commandMessage && content.match(/^\/NG\s+(.+)$/);
     if (ngMatch) {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
-      for (const word of ngMatch[1].trim().split(/\s+/)) {
+      for (const word of ngMatch[1].trim().split(/\s+/))
         await pool.query(`INSERT INTO ng_words (word) VALUES ($1) ON CONFLICT DO NOTHING`, [word]);
-      }
       commandMessage = "/NG";
     }
 
-    // /OK 言葉 [...]
+    // /OK
     const okMatch = !commandMessage && content.match(/^\/OK\s+(.+)$/);
     if (okMatch) {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
-      for (const word of okMatch[1].trim().split(/\s+/)) {
+      for (const word of okMatch[1].trim().split(/\s+/))
         await pool.query(`DELETE FROM ng_words WHERE word=$1`, [word]);
-      }
       commandMessage = "/OK";
     }
 
@@ -332,7 +349,7 @@ async function handlePost(table, topicKey, req, res) {
       commandMessage = "/stop";
     }
 
-    // /prohibit 時間 (例: 3h, 5m, 2h30m)
+    // /prohibit
     const prohibitMatch = !commandMessage && content.match(/^\/prohibit\s+(\d+h)?(\d+m)?$/i);
     if (prohibitMatch && (prohibitMatch[1] || prohibitMatch[2])) {
       if (role < 4) return res.status(403).json({ error: "権限不足 (運営のみ)" });
@@ -363,9 +380,8 @@ async function handlePost(table, topicKey, req, res) {
       for (const targetId of targets) {
         const tid = targetId.startsWith("@") ? targetId : "@" + targetId;
         await pool.query(`INSERT INTO ${tableMap[grantLevel]} (id) VALUES ($1) ON CONFLICT DO NOTHING`, [tid]);
-        for (let l = 1; l < grantLevel; l++) {
+        for (let l = 1; l < grantLevel; l++)
           await pool.query(`DELETE FROM ${tableMap[l]} WHERE id=$1`, [tid]);
-        }
       }
       commandMessage = `/${cmd}`;
     }
@@ -400,7 +416,7 @@ async function handlePost(table, topicKey, req, res) {
       }
     }
 
-    // /kill ID [...]
+    // /kill
     const killMatch = !commandMessage && content.match(/^\/kill\s+(.+)$/);
     if (killMatch) {
       if (role < 3) return res.status(403).json({ error: "権限不足 (サミット以上必要)" });
@@ -411,7 +427,7 @@ async function handlePost(table, topicKey, req, res) {
       commandMessage = "/kill";
     }
 
-    // /ban ID/投稿番号 [...]
+    // /ban
     const banMatch = !commandMessage && content.match(/^\/ban\s+(.+)$/);
     if (banMatch) {
       if (role < 3) return res.status(403).json({ error: "権限不足 (サミット以上必要)" });
@@ -435,7 +451,7 @@ async function handlePost(table, topicKey, req, res) {
       commandMessage = "/revive";
     }
 
-    // /add ID サフィックス
+    // /add
     const addMatch = !commandMessage && content.match(/^\/add\s+(\S+)\s+(.+)$/);
     if (addMatch) {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
@@ -447,7 +463,7 @@ async function handlePost(table, topicKey, req, res) {
       commandMessage = "/add";
     }
 
-    // /color #カラーコード ID
+    // /color
     const colorMatch = !commandMessage && content.match(/^\/color\s+(#[0-9a-fA-F]{3,6})\s+(\S+)$/);
     if (colorMatch) {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
@@ -472,7 +488,7 @@ async function handlePost(table, topicKey, req, res) {
       commandMessage = "/instances";
     }
 
-    // /seedsearch（送信なし・権限別個数）
+    // /seedsearch
     if (!commandMessage && content.trim() === "/seedsearch") {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
       const count = role >= 4 ? 200 : role >= 3 ? 100 : 10;
@@ -491,25 +507,17 @@ async function handlePost(table, topicKey, req, res) {
     // =====================
     if (!commandMessage && role === 0) {
       const rs = await getRestrictionStatus();
-
-      // /prevent は雑談のみ
       if (table === "posts" && rs.prevent)
         return res.status(403).json({ error: "現在青IDは投稿できません (/prevent中)" });
-
-      // /stop・/prohibit は全サーバー共通
       if (rs.stopActive)
         return res.status(403).json({ error: "現在青IDは投稿できません (/stop中)" });
       if (rs.prohibitActive)
         return res.status(403).json({ error: "現在青IDは投稿できません (/prohibit中)" });
-
-      // /restrict: banされた青IDはどのサーバーも投稿不可
       if (rs.restrict) {
         const { rows: banRows } = await pool.query(`SELECT 1 FROM ban WHERE id=$1`, [hashedId]);
         if (banRows.length)
           return res.status(403).json({ error: "投稿が禁止されています" });
       }
-
-      // NGワードチェック
       const { rows: ngWords } = await pool.query(`SELECT word FROM ng_words`);
       for (const { word } of ngWords) {
         if (content.includes(word))
@@ -525,6 +533,9 @@ async function handlePost(table, topicKey, req, res) {
       [name, content, hashedId, time]
     );
 
+    const enrichedPost = (await enrichPosts([inserted[0]]))[0];
+    broadcast(channel, { type: "post", post: enrichedPost });
+
     requestTimestamps[pass] = now;
     res.status(200).json({
       message: commandMessage ?? "投稿成功",
@@ -538,20 +549,13 @@ async function handlePost(table, topicKey, req, res) {
 }
 
 // ----------------------
-// 掲示板API（雑談）
+// API エンドポイント
 // ----------------------
-app.get( "/api",  (req, res) => handleGet("posts",        "topic",        res));
-app.post("/api",  (req, res) => handlePost("posts",       "topic",        req, res));
+app.get( "/api",         (req, res) => handleGet("posts",        "topic",        res));
+app.post("/api",         (req, res) => handlePost("posts",       "topic",        "chat",   req, res));
+app.get( "/api/battle",  (req, res) => handleGet("battle_posts", "battle_topic", res));
+app.post("/api/battle",  (req, res) => handlePost("battle_posts","battle_topic", "battle", req, res));
 
-// ----------------------
-// 掲示板API（バトルスタジアム）
-// ----------------------
-app.get( "/api/battle", (req, res) => handleGet("battle_posts",  "battle_topic", res));
-app.post("/api/battle", (req, res) => handlePost("battle_posts", "battle_topic", req, res));
-
-// ----------------------
-// 管理用エンドポイント
-// ----------------------
 app.post("/topic", async (req, res) => {
   const { topic, adminPassword } = req.body;
   if (!topic) return res.status(400).json({ error: "トピック入力必須" });
@@ -576,13 +580,12 @@ app.get("/id", async (req, res) => {
   res.json(rows.map(r => r.id));
 });
 
-// GET /seedsearch?pass=パスワード
 app.get("/seedsearch", async (req, res) => {
   const { pass } = req.query;
   if (!pass) return res.status(400).json({ error: "pass必須" });
   const hashedId = "@" + crypto.createHash("sha256").update(pass).digest("hex").substr(0, 7);
   const role = await getRole(hashedId);
-  if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
+  if (role < 2) return res.status(403).json({ error: "権限不足" });
   const count = role >= 4 ? 200 : role >= 3 ? 100 : 10;
   const seeds = [];
   for (let i = 0; i < count; i++) {
@@ -594,7 +597,7 @@ app.get("/seedsearch", async (req, res) => {
 });
 
 // ----------------------
-// ChatWork 未読既読機能
+// ChatWork
 // ----------------------
 const cwJobs = {};
 
@@ -653,6 +656,6 @@ app.post("/cw-read/check", async (req, res) => {
 // ----------------------
 // サーバー起動
 // ----------------------
-app.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`サーバーがポート ${PORT} で起動しました。`);
 });
