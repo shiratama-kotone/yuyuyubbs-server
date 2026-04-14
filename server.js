@@ -36,6 +36,23 @@ function broadcast(channel, data) {
   wss.clients.forEach(client => {
     if (client.readyState === 1) client.send(msg);
   });
+  // Webhookへ送信（投稿イベントのみ）
+  if (data.type === "post" && data.post) {
+    const post = data.post;
+    const payload = {
+      event_time: new Date().toISOString(),
+      id:         post.id,
+      name:       post.name,
+      no:         post.no,
+      content:    post.content,
+      channel,
+    };
+    pool.query(`SELECT url FROM webhooks WHERE channel=$1`, [channel]).then(({ rows }) => {
+      rows.forEach(({ url }) => {
+        axios.post(url, payload, { timeout: 5000 }).catch(() => {});
+      });
+    }).catch(() => {});
+  }
 }
 
 wss.on("connection", (ws) => {
@@ -88,6 +105,25 @@ async function initDB() {
     await client.query(`CREATE TABLE IF NOT EXISTS ng_words  (word TEXT PRIMARY KEY)`);
     await client.query(`CREATE TABLE IF NOT EXISTS ban       (id TEXT PRIMARY KEY)`);
     await client.query(`CREATE TABLE IF NOT EXISTS kill_list (id TEXT PRIMARY KEY)`);
+
+    // アカウント・Webhookテーブル
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS accounts (
+        username    TEXT PRIMARY KEY,
+        bbs_id      TEXT NOT NULL,
+        token       TEXT NOT NULL UNIQUE,
+        created_at  TIMESTAMPTZ DEFAULT now()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS webhooks (
+        id          SERIAL PRIMARY KEY,
+        username    TEXT NOT NULL REFERENCES accounts(username) ON DELETE CASCADE,
+        url         TEXT NOT NULL,
+        channel     TEXT NOT NULL DEFAULT 'chat',
+        created_at  TIMESTAMPTZ DEFAULT now()
+      )
+    `);
 
     // 雑談シード投稿
     await client.query(`
@@ -594,6 +630,136 @@ app.get("/seedsearch", async (req, res) => {
     seeds.push({ pass: seedPass, id });
   }
   res.json({ seeds });
+});
+
+// ----------------------
+// アカウント API
+// ----------------------
+
+// トークン認証ミドルウェア
+async function requireAuth(req, res, next) {
+  const auth = req.headers["authorization"] || "";
+  const token = auth.replace(/^Bearer\s+/, "").trim();
+  if (!token) return res.status(401).json({ error: "認証が必要です" });
+  const { rows } = await pool.query(`SELECT * FROM accounts WHERE token=$1`, [token]);
+  if (!rows.length) return res.status(401).json({ error: "トークンが無効です" });
+  req.account = rows[0];
+  next();
+}
+
+// アカウント作成
+app.post("/account/register", async (req, res) => {
+  const { username, bbs_id, bbs_pass } = req.body;
+  if (!username || !bbs_id || !bbs_pass)
+    return res.status(400).json({ error: "username, bbs_id, bbs_pass は必須" });
+  if (!/^[A-Za-z0-9_]{3,20}$/.test(username))
+    return res.status(400).json({ error: "usernameは英数字・アンダースコア3〜20文字" });
+
+  // bbs_passからIDを計算して一致確認
+  const calcId = "@" + crypto.createHash("sha256").update(bbs_pass).digest("base64").replace(/[^A-Za-z0-9]/g, "").substr(0, 7);
+  if (calcId !== bbs_id)
+    return res.status(400).json({ error: "bbs_idとbbs_passが一致しません" });
+
+  const { rows: existing } = await pool.query(`SELECT 1 FROM accounts WHERE username=$1`, [username]);
+  if (existing.length) return res.status(409).json({ error: "そのユーザー名は既に使われています" });
+
+  const token = uuidv4();
+  await pool.query(
+    `INSERT INTO accounts (username, bbs_id, token) VALUES ($1, $2, $3)`,
+    [username, bbs_id, token]
+  );
+  res.status(201).json({ message: "アカウントを作成しました", token });
+});
+
+// ログイン（トークン再発行）
+app.post("/account/login", async (req, res) => {
+  const { bbs_id, bbs_pass } = req.body;
+  if (!bbs_id || !bbs_pass)
+    return res.status(400).json({ error: "bbs_id, bbs_pass は必須" });
+
+  const calcId = "@" + crypto.createHash("sha256").update(bbs_pass).digest("base64").replace(/[^A-Za-z0-9]/g, "").substr(0, 7);
+  if (calcId !== bbs_id)
+    return res.status(400).json({ error: "bbs_idとbbs_passが一致しません" });
+
+  const { rows } = await pool.query(`SELECT * FROM accounts WHERE bbs_id=$1`, [bbs_id]);
+  if (!rows.length) return res.status(404).json({ error: "アカウントが見つかりません" });
+
+  const token = uuidv4();
+  await pool.query(`UPDATE accounts SET token=$1 WHERE bbs_id=$2`, [token, bbs_id]);
+  res.json({ message: "ログイン成功", token, username: rows[0].username });
+});
+
+// 自分の情報
+app.get("/account/me", requireAuth, (req, res) => {
+  const { username, bbs_id, created_at } = req.account;
+  res.json({ username, bbs_id, created_at });
+});
+
+// ----------------------
+// Webhook API
+// ----------------------
+
+// Webhook一覧取得
+app.get("/webhooks", requireAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, url, channel, created_at FROM webhooks WHERE username=$1 ORDER BY id`,
+    [req.account.username]
+  );
+  res.json({ webhooks: rows });
+});
+
+// Webhook登録
+app.post("/webhooks", requireAuth, async (req, res) => {
+  const { url, channel } = req.body;
+  if (!url) return res.status(400).json({ error: "urlは必須" });
+  const ch = ["chat", "battle"].includes(channel) ? channel : "chat";
+  try { new URL(url); } catch { return res.status(400).json({ error: "urlが不正です" }); }
+
+  const { rows: existing } = await pool.query(
+    `SELECT COUNT(*) AS cnt FROM webhooks WHERE username=$1`,
+    [req.account.username]
+  );
+  if (parseInt(existing[0].cnt) >= 10)
+    return res.status(400).json({ error: "Webhookは1アカウント10件まで" });
+
+  const { rows } = await pool.query(
+    `INSERT INTO webhooks (username, url, channel) VALUES ($1, $2, $3) RETURNING *`,
+    [req.account.username, url, ch]
+  );
+  res.status(201).json({ webhook: rows[0] });
+});
+
+// Webhook削除
+app.delete("/webhooks/:id", requireAuth, async (req, res) => {
+  const { rowCount } = await pool.query(
+    `DELETE FROM webhooks WHERE id=$1 AND username=$2`,
+    [parseInt(req.params.id), req.account.username]
+  );
+  if (!rowCount) return res.status(404).json({ error: "見つかりません" });
+  res.json({ message: "削除しました" });
+});
+
+// Webhookテスト送信
+app.post("/webhooks/:id/test", requireAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT * FROM webhooks WHERE id=$1 AND username=$2`,
+    [parseInt(req.params.id), req.account.username]
+  );
+  if (!rows.length) return res.status(404).json({ error: "見つかりません" });
+  const payload = {
+    event_time: new Date().toISOString(),
+    id:         "(テスト)",
+    name:       "テストユーザー",
+    no:         0,
+    content:    "これはWebhookのテスト送信です",
+    channel:    rows[0].channel,
+  };
+  try {
+    await axios.post(rows[0].url, payload, { timeout: 5000 });
+    res.json({ message: "テスト送信成功" });
+  } catch (err) {
+    res.status(502).json({ error: "送信失敗: " + err.message });
+  }
 });
 
 // ----------------------
