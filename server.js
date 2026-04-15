@@ -45,6 +45,7 @@ function broadcast(channel, data) {
       name:       post.name,
       no:         post.no,
       content:    post.content,
+      role:       post.role ?? 0,
       channel,
     };
     pool.query(`SELECT url FROM webhooks WHERE channel=$1`, [channel]).then(({ rows }) => {
@@ -121,6 +122,16 @@ async function initDB() {
         username    TEXT NOT NULL REFERENCES accounts(username) ON DELETE CASCADE,
         url         TEXT NOT NULL,
         channel     TEXT NOT NULL DEFAULT 'chat',
+        created_at  TIMESTAMPTZ DEFAULT now()
+      )
+    `);
+    // 地雷テーブル
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS mines (
+        id          SERIAL PRIMARY KEY,
+        word        TEXT NOT NULL,
+        channel     TEXT NOT NULL DEFAULT 'chat',
+        created_by  TEXT NOT NULL,
         created_at  TIMESTAMPTZ DEFAULT now()
       )
     `);
@@ -302,6 +313,7 @@ async function handlePost(table, topicKey, channel, req, res) {
       const colorMap = { blue: 0, darkorange: 1, red: 2, darkcyan: 3 };
       for (const target of targets) {
         if (colorMap[target] !== undefined) {
+          // 権限色で削除
           const tableMap = { 1: "speaker", 2: "manager", 3: "summit" };
           let ids = [];
           if (colorMap[target] === 0) {
@@ -320,8 +332,10 @@ async function handlePost(table, topicKey, channel, req, res) {
             );
           }
         } else {
+          // 文字列・ID・名前の部分一致で削除
           await pool.query(
-            `UPDATE ${table} SET name='削除されました', content='削除されました', id='', deleted=TRUE WHERE content LIKE $1 OR id=$2`,
+            `UPDATE ${table} SET name='削除されました', content='削除されました', id='', deleted=TRUE
+             WHERE content LIKE $1 OR id=$2 OR name LIKE $1`,
             [`%${target}%`, target]
           );
         }
@@ -538,6 +552,34 @@ async function handlePost(table, topicKey, channel, req, res) {
       return res.status(200).json({ message: "/seedsearch", seeds });
     }
 
+    // /mine 言葉 — 地雷設置
+    const mineMatch = !commandMessage && content.match(/^\/mine\s+(.+)$/);
+    if (mineMatch) {
+      if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
+      const word = mineMatch[1].trim();
+      await pool.query(
+        `INSERT INTO mines (word, channel, created_by) VALUES ($1, $2, $3)`,
+        [word, channel, hashedId]
+      );
+      commandMessage = "/mine";
+    }
+
+    // /mineoff 言葉 — 地雷解除
+    const mineoffMatch = !commandMessage && content.match(/^\/mineoff\s+(.+)$/);
+    if (mineoffMatch) {
+      if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
+      await pool.query(`DELETE FROM mines WHERE word=$1 AND channel=$2`, [mineoffMatch[1].trim(), channel]);
+      commandMessage = "/mineoff";
+    }
+
+    // /mines — 地雷一覧
+    if (!commandMessage && content.trim() === "/mines") {
+      if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
+      const { rows: mineList } = await pool.query(`SELECT word FROM mines WHERE channel=$1`, [channel]);
+      requestTimestamps[pass] = now;
+      return res.status(200).json({ message: "/mines", mines: mineList.map(m => m.word) });
+    }
+
     // =====================
     // 通常投稿
     // =====================
@@ -571,6 +613,17 @@ async function handlePost(table, topicKey, channel, req, res) {
 
     const enrichedPost = (await enrichPosts([inserted[0]]))[0];
     broadcast(channel, { type: "post", post: enrichedPost });
+
+    // 地雷チェック（通常投稿のみ・0.05%の確率）
+    if (!commandMessage && Math.random() < 0.0005) {
+      const mineTime = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
+      const { rows: minePost } = await pool.query(
+        `INSERT INTO ${table} (name, content, id, time) VALUES ('さーばー', $1, '( ᐛ )', $2) RETURNING *`,
+        [`>>${inserted[0].no} 地雷踏んじゃったね…`, mineTime]
+      );
+      const enrichedMine = (await enrichPosts([minePost[0]]))[0];
+      broadcast(channel, { type: "post", post: enrichedMine });
+    }
 
     requestTimestamps[pass] = now;
     res.status(200).json({
@@ -825,3 +878,60 @@ app.post("/cw-read/check", async (req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`サーバーがポート ${PORT} で起動しました。`);
 });
+
+// ----------------------
+// 地震速報（P2P地震情報APIをポーリング）
+// ----------------------
+let lastEqId = null;
+
+async function checkEarthquake() {
+  try {
+    const res = await axios.get("https://api.p2pquake.net/v2/history?codes=551&limit=1", { timeout: 5000 });
+    const data = res.data;
+    if (!data || !data.length) return;
+    const eq = data[0];
+    if (eq.id === lastEqId) return;
+    lastEqId = eq.id;
+
+    const issue   = eq.earthquake?.time ?? null;
+    const hypo    = eq.earthquake?.hypocenter;
+    const maxScale = eq.earthquake?.maxScale ?? -1;
+
+    let dateStr = "不明";
+    if (issue) {
+      const d = new Date(issue);
+      const pad = n => String(n).padStart(2, "0");
+      dateStr = `${d.getFullYear()}年${pad(d.getMonth()+1)}月${pad(d.getDate())}日${pad(d.getHours())}時${pad(d.getMinutes())}分`;
+    }
+
+    // 震度変換
+    const scaleMap = { 10:"1", 20:"2", 30:"3", 40:"4", 45:"5弱", 50:"5強", 55:"6弱", 60:"6強", 70:"7" };
+    const scaleStr = scaleMap[maxScale] ?? "不明";
+
+    let msgContent;
+    if (!hypo || !hypo.name || maxScale < 0) {
+      msgContent = `${dateStr}に地震が発生しました。\n今後の情報に気をつけてください。`;
+    } else {
+      msgContent = `${dateStr}に${hypo.name}で震度${scaleStr}の地震が発生しました。\nマグニチュードは${hypo.magnitude ?? "不明"}です。\nこれからも気をつけてください。`;
+    }
+
+    const eqTime = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
+    // 雑談のみに送信
+    const { rows: eqPost } = await pool.query(
+      `INSERT INTO posts (name, content, id, time) VALUES ('地震速報', $1, 'EQALERT', $2) RETURNING *`,
+      [msgContent, eqTime]
+    );
+    const enriched = (await enrichPosts([eqPost[0]]))[0];
+    broadcast("chat", { type: "post", post: enriched });
+    console.log("地震速報を送信しました:", dateStr);
+  } catch (e) {
+    // ポーリングエラーは無視
+  }
+}
+
+// 1分ごとにチェック
+setInterval(checkEarthquake, 60 * 1000);
+// 起動時にも取得して lastEqId を初期化（重複送信防止）
+axios.get("https://api.p2pquake.net/v2/history?codes=551&limit=1", { timeout: 5000 })
+  .then(r => { if (r.data && r.data.length) lastEqId = r.data[0].id; })
+  .catch(() => {});
