@@ -3,6 +3,7 @@ const express = require("express");
 const http = require("http");
 const { WebSocketServer } = require("ws");
 const bodyParser = require("body-parser");
+const cookieParser = require("cookie-parser");
 const crypto = require("crypto");
 const cors = require("cors");
 const axios = require("axios");
@@ -21,6 +22,7 @@ const pool = new Pool({
 });
 
 app.use(cors());
+app.use(cookieParser());
 app.use(express.static("public"));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
@@ -111,10 +113,20 @@ async function initDB() {
     await client.query(`
       CREATE TABLE IF NOT EXISTS accounts (
         username    TEXT PRIMARY KEY,
-        bbs_id      TEXT NOT NULL,
+        bbs_id      TEXT NOT NULL UNIQUE,
         token       TEXT NOT NULL UNIQUE,
+        api_key     TEXT UNIQUE,
+        dm_id       TEXT NOT NULL UNIQUE,
         created_at  TIMESTAMPTZ DEFAULT now()
       )
+    `);
+    // カラム追加（既存DBへの対応）
+    await client.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS api_key TEXT UNIQUE`);
+    await client.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS dm_id TEXT`);
+    // dm_idがNULLの既存アカウントに9桁IDを割り当て
+    await client.query(`
+      UPDATE accounts SET dm_id = LPAD(FLOOR(RANDOM() * 1000000000)::TEXT, 9, '0')
+      WHERE dm_id IS NULL
     `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS webhooks (
@@ -125,6 +137,17 @@ async function initDB() {
         created_at  TIMESTAMPTZ DEFAULT now()
       )
     `);
+    // DMテーブル
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS dms (
+        id          SERIAL PRIMARY KEY,
+        room_id     TEXT NOT NULL,
+        sender_dm   TEXT NOT NULL,
+        content     TEXT NOT NULL,
+        time        TIMESTAMPTZ DEFAULT now()
+      )
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS dms_room_idx ON dms(room_id, time DESC)`);
     // 地雷テーブル
     await client.query(`
       CREATE TABLE IF NOT EXISTS mines (
@@ -210,14 +233,19 @@ async function getRestrictionStatus() {
 
 async function enrichPosts(posts) {
   return Promise.all(posts.map(async (p) => {
-    const role = await getRole(p.id);
-    const { rows: colorRows } = await pool.query(`SELECT color_code FROM color WHERE id=$1`, [p.id]);
-    const { rows: addRows }   = await pool.query(`SELECT suffix FROM "add" WHERE id=$1`, [p.id]);
+    const [roleVal, colorResult, addResult, verifiedResult] = await Promise.all([
+      getRole(p.id),
+      pool.query(`SELECT color_code FROM color WHERE id=$1`, [p.id]),
+      pool.query(`SELECT suffix FROM "add" WHERE id=$1`, [p.id]),
+      pool.query(`SELECT dm_id FROM accounts WHERE bbs_id=$1`, [p.id]),
+    ]);
     return {
       ...p,
-      role,
-      colorCode: colorRows[0]?.color_code ?? null,
-      addSuffix: addRows[0]?.suffix ?? null,
+      role:      roleVal,
+      colorCode: colorResult.rows[0]?.color_code ?? null,
+      addSuffix: addResult.rows[0]?.suffix ?? null,
+      verified:  verifiedResult.rows.length > 0,
+      dm_id:     verifiedResult.rows[0]?.dm_id ?? null,
     };
   }));
 }
@@ -846,15 +874,43 @@ app.get("/seedsearch", async (req, res) => {
 // アカウント API
 // ----------------------
 
-// トークン認証ミドルウェア
+// トークン認証ミドルウェア（Bearer or Cookie）
 async function requireAuth(req, res, next) {
   const auth = req.headers["authorization"] || "";
-  const token = auth.replace(/^Bearer\s+/, "").trim();
+  const token = auth.replace(/^Bearer\s+/, "").trim()
+             || req.cookies?.bbs_session || "";
   if (!token) return res.status(401).json({ error: "認証が必要です" });
   const { rows } = await pool.query(`SELECT * FROM accounts WHERE token=$1`, [token]);
   if (!rows.length) return res.status(401).json({ error: "トークンが無効です" });
   req.account = rows[0];
   next();
+}
+
+// APIキー認証ミドルウェア
+async function requireApiKey(req, res, next) {
+  const key = req.headers["x-api-key"] || req.query.api_key || "";
+  if (!key) return res.status(401).json({ error: "APIキーが必要です" });
+  const { rows } = await pool.query(`SELECT * FROM accounts WHERE api_key=$1`, [key]);
+  if (!rows.length) return res.status(401).json({ error: "APIキーが無効です" });
+  req.account = rows[0];
+  next();
+}
+
+// どちらかで認証
+async function requireAnyAuth(req, res, next) {
+  const apiKey = req.headers["x-api-key"] || req.query.api_key || "";
+  if (apiKey) return requireApiKey(req, res, next);
+  return requireAuth(req, res, next);
+}
+
+// 9桁DM ID生成（重複チェック付き）
+async function generateDmId() {
+  for (let i = 0; i < 10; i++) {
+    const id = String(Math.floor(Math.random() * 1000000000)).padStart(9, "0");
+    const { rows } = await pool.query(`SELECT 1 FROM accounts WHERE dm_id=$1`, [id]);
+    if (!rows.length) return id;
+  }
+  return String(Date.now()).slice(-9); // フォールバック
 }
 
 // アカウント作成
@@ -865,20 +921,20 @@ app.post("/account/register", async (req, res) => {
   if (!/^[A-Za-z0-9_]{3,20}$/.test(username))
     return res.status(400).json({ error: "usernameは英数字・アンダースコア3〜20文字" });
 
-  // bbs_passからIDを計算して一致確認
   const calcId = "@" + crypto.createHash("sha256").update(bbs_pass).digest("base64").replace(/[^A-Za-z0-9]/g, "").substr(0, 7);
   if (calcId !== bbs_id)
     return res.status(400).json({ error: "bbs_idとbbs_passが一致しません" });
 
-  const { rows: existing } = await pool.query(`SELECT 1 FROM accounts WHERE username=$1`, [username]);
-  if (existing.length) return res.status(409).json({ error: "そのユーザー名は既に使われています" });
+  const { rows: existing } = await pool.query(`SELECT 1 FROM accounts WHERE username=$1 OR bbs_id=$2`, [username, bbs_id]);
+  if (existing.length) return res.status(409).json({ error: "そのユーザー名またはIDは既に使われています" });
 
   const token = uuidv4();
+  const dm_id = await generateDmId();
   await pool.query(
-    `INSERT INTO accounts (username, bbs_id, token) VALUES ($1, $2, $3)`,
-    [username, bbs_id, token]
+    `INSERT INTO accounts (username, bbs_id, token, dm_id) VALUES ($1, $2, $3, $4)`,
+    [username, bbs_id, token, dm_id]
   );
-  res.status(201).json({ message: "アカウントを作成しました", token });
+  res.status(201).json({ message: "アカウントを作成しました", token, dm_id });
 });
 
 // ログイン（トークン再発行）
@@ -896,13 +952,109 @@ app.post("/account/login", async (req, res) => {
 
   const token = uuidv4();
   await pool.query(`UPDATE accounts SET token=$1 WHERE bbs_id=$2`, [token, bbs_id]);
-  res.json({ message: "ログイン成功", token, username: rows[0].username });
+  res.json({ message: "ログイン成功", token, username: rows[0].username, dm_id: rows[0].dm_id });
 });
 
 // 自分の情報
 app.get("/account/me", requireAuth, (req, res) => {
-  const { username, bbs_id, created_at } = req.account;
-  res.json({ username, bbs_id, created_at });
+  const { username, bbs_id, dm_id, api_key, created_at } = req.account;
+  res.json({ username, bbs_id, dm_id, has_api_key: !!api_key, created_at });
+});
+
+// APIキー発行・再発行
+app.post("/account/apikey", requireAuth, async (req, res) => {
+  const newKey = "bbs_" + crypto.randomBytes(24).toString("base64url");
+  await pool.query(`UPDATE accounts SET api_key=$1 WHERE username=$2`, [newKey, req.account.username]);
+  res.json({ api_key: newKey });
+});
+
+// APIキー取得（現在のキーを表示）
+app.get("/account/apikey", requireAuth, async (req, res) => {
+  const { rows } = await pool.query(`SELECT api_key FROM accounts WHERE username=$1`, [req.account.username]);
+  if (!rows[0]?.api_key) return res.status(404).json({ error: "APIキーが未発行です" });
+  res.json({ api_key: rows[0].api_key });
+});
+
+// ----------------------
+// DM API
+// ----------------------
+
+// DM room_id = 小さい方_大きい方 で一意
+function dmRoomId(a, b) {
+  return [a, b].sort().join("_");
+}
+
+// DM送信可能なユーザー一覧（自分と会話したことがある or bbs_idで検索）
+app.get("/dm/users", requireAnyAuth, async (req, res) => {
+  const q = req.query.q || "";
+  let rows;
+  if (q) {
+    const result = await pool.query(
+      `SELECT username, bbs_id, dm_id FROM accounts WHERE (username ILIKE $1 OR bbs_id ILIKE $2 OR dm_id=$3) AND username != $4 LIMIT 20`,
+      [`%${q}%`, `%${q}%`, q, req.account.username]
+    );
+    rows = result.rows;
+  } else {
+    // 最近DMした相手一覧
+    const myDmId = req.account.dm_id;
+    const { rows: rooms } = await pool.query(
+      `SELECT DISTINCT room_id FROM dms WHERE room_id LIKE $1 ORDER BY room_id`,
+      [`%${myDmId}%`]
+    );
+    const peerDmIds = rooms.map(r => r.room_id.split("_").find(id => id !== myDmId)).filter(Boolean);
+    if (!peerDmIds.length) return res.json({ users: [] });
+    const result = await pool.query(
+      `SELECT username, bbs_id, dm_id FROM accounts WHERE dm_id = ANY($1)`,
+      [peerDmIds]
+    );
+    rows = result.rows;
+  }
+  res.json({ users: rows });
+});
+
+// DM履歴取得
+app.get("/dm/:dm_id", requireAnyAuth, async (req, res) => {
+  const myDmId   = req.account.dm_id;
+  const peerDmId = req.params.dm_id;
+  // 相手がアカウント存在確認
+  const { rows: peer } = await pool.query(`SELECT username, bbs_id, dm_id FROM accounts WHERE dm_id=$1`, [peerDmId]);
+  if (!peer.length) return res.status(404).json({ error: "ユーザーが見つかりません" });
+
+  const roomId = dmRoomId(myDmId, peerDmId);
+  const limit  = Math.min(parseInt(req.query.limit ?? "50"), 100);
+  const before = req.query.before ? parseInt(req.query.before) : null;
+
+  const query  = before
+    ? `SELECT * FROM dms WHERE room_id=$1 AND id < $2 ORDER BY id DESC LIMIT $3`
+    : `SELECT * FROM dms WHERE room_id=$1 ORDER BY id DESC LIMIT $2`;
+  const params = before ? [roomId, before, limit] : [roomId, limit];
+
+  const { rows: messages } = await pool.query(query, params);
+  res.json({ room_id: roomId, peer: peer[0], messages: messages.reverse() });
+});
+
+// DM送信
+app.post("/dm/:dm_id", requireAnyAuth, async (req, res) => {
+  const myDmId   = req.account.dm_id;
+  const peerDmId = req.params.dm_id;
+  const { content } = req.body;
+  if (!content?.trim()) return res.status(400).json({ error: "contentは必須" });
+  if (content.length > 1000) return res.status(400).json({ error: "1000文字以内で" });
+
+  const { rows: peer } = await pool.query(`SELECT dm_id FROM accounts WHERE dm_id=$1`, [peerDmId]);
+  if (!peer.length) return res.status(404).json({ error: "ユーザーが見つかりません" });
+
+  const roomId = dmRoomId(myDmId, peerDmId);
+  const { rows: inserted } = await pool.query(
+    `INSERT INTO dms (room_id, sender_dm, content) VALUES ($1, $2, $3) RETURNING *`,
+    [roomId, myDmId, content.trim()]
+  );
+
+  // WebSocketでリアルタイム通知
+  const msg = JSON.stringify({ type: "dm", room_id: roomId, message: inserted[0] });
+  wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
+
+  res.status(201).json({ message: inserted[0] });
 });
 
 // ----------------------
