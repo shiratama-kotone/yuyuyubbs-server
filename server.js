@@ -30,6 +30,148 @@ app.use(bodyParser.json());
 const requestTimestamps = {};
 
 // ----------------------
+// インメモリストア
+// ----------------------
+const store = {
+  // 投稿: { chat: Map<no, post>, battle: Map<no, post> }
+  posts:   { chat: new Map(), battle: new Map() },
+  // 権限: Set<id>
+  roles:   { admin: new Set(), summit: new Set(), manager: new Set(), speaker: new Set() },
+  // 設定: Map<key, value>
+  settings: new Map(),
+  // color/add: Map<id, value>
+  color:   new Map(),
+  add:     new Map(),
+  // ng/ban/kill: Set<word or id>
+  ng:      new Set(),
+  ban:     new Set(),
+  kill:    new Set(),
+  // nextNo
+  nextNo:  { chat: 3, battle: 1 },
+};
+
+// DBから全データをメモリに読み込む
+async function loadFromDB() {
+  const client = await pool.connect();
+  try {
+    // 投稿
+    const { rows: chatPosts }   = await client.query(`SELECT * FROM posts ORDER BY no ASC`);
+    const { rows: battlePosts } = await client.query(`SELECT * FROM battle_posts ORDER BY no ASC`);
+    store.posts.chat.clear();
+    store.posts.battle.clear();
+    chatPosts.forEach(p => store.posts.chat.set(p.no, p));
+    battlePosts.forEach(p => store.posts.battle.set(p.no, p));
+    if (chatPosts.length)   store.nextNo.chat   = Math.max(...chatPosts.map(p => p.no))   + 1;
+    if (battlePosts.length) store.nextNo.battle = Math.max(...battlePosts.map(p => p.no)) + 1;
+
+    // 権限
+    for (const role of ["admin", "summit", "manager", "speaker"]) {
+      const { rows } = await client.query(`SELECT id FROM ${role}`);
+      store.roles[role] = new Set(rows.map(r => r.id));
+    }
+
+    // 設定
+    const { rows: settings } = await client.query(`SELECT key, value FROM settings`);
+    settings.forEach(s => store.settings.set(s.key, s.value));
+
+    // color / add
+    const { rows: colors } = await client.query(`SELECT id, color_code FROM color`);
+    colors.forEach(c => store.color.set(c.id, c.color_code));
+    const { rows: adds }   = await client.query(`SELECT id, suffix FROM "add"`);
+    adds.forEach(a => store.add.set(a.id, a.suffix));
+
+    // ng / ban / kill
+    const { rows: ngRows }   = await client.query(`SELECT word FROM ng_words`);
+    const { rows: banRows }  = await client.query(`SELECT id FROM ban`);
+    const { rows: killRows } = await client.query(`SELECT id FROM kill_list`);
+    store.ng   = new Set(ngRows.map(r => r.word));
+    store.ban  = new Set(banRows.map(r => r.id));
+    store.kill = new Set(killRows.map(r => r.id));
+
+    console.log(`メモリ読み込み完了: 雑談${store.posts.chat.size}件, バトル${store.posts.battle.size}件`);
+  } finally {
+    client.release();
+  }
+}
+
+// メモリの内容をDBへ書き戻す
+async function saveToDB() {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 投稿テーブルを全置換
+    for (const [table, channel] of [["posts","chat"],["battle_posts","battle"]]) {
+      await client.query(`DELETE FROM ${table}`);
+      const posts = Array.from(store.posts[channel].values());
+      for (const p of posts) {
+        await client.query(
+          `INSERT INTO ${table} (no, name, content, id, time, deleted) VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (no) DO UPDATE SET name=$2, content=$3, id=$4, time=$5, deleted=$6`,
+          [p.no, p.name, p.content, p.id, p.time, p.deleted ?? false]
+        );
+      }
+    }
+
+    // 権限
+    for (const role of ["admin","summit","manager","speaker"]) {
+      await client.query(`DELETE FROM ${role}`);
+      for (const id of store.roles[role]) {
+        await client.query(`INSERT INTO ${role} (id) VALUES ($1) ON CONFLICT DO NOTHING`, [id]);
+      }
+    }
+
+    // 設定
+    for (const [key, value] of store.settings) {
+      await client.query(
+        `INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2`,
+        [key, value]
+      );
+    }
+
+    // color / add
+    await client.query(`DELETE FROM color`);
+    for (const [id, code] of store.color) {
+      await client.query(`INSERT INTO color (id, color_code) VALUES ($1,$2)`, [id, code]);
+    }
+    await client.query(`DELETE FROM "add"`);
+    for (const [id, suffix] of store.add) {
+      await client.query(`INSERT INTO "add" (id, suffix) VALUES ($1,$2)`, [id, suffix]);
+    }
+
+    // ng / ban / kill
+    await client.query(`DELETE FROM ng_words`);
+    for (const w of store.ng)   await client.query(`INSERT INTO ng_words (word) VALUES ($1)`, [w]);
+    await client.query(`DELETE FROM ban`);
+    for (const id of store.ban) await client.query(`INSERT INTO ban (id) VALUES ($1)`, [id]);
+    await client.query(`DELETE FROM kill_list`);
+    for (const id of store.kill) await client.query(`INSERT INTO kill_list (id) VALUES ($1)`, [id]);
+
+    await client.query("COMMIT");
+    console.log(`DB保存完了: ${new Date().toLocaleString("ja-JP", {timeZone:"Asia/Tokyo"})}`);
+  } catch(e) {
+    await client.query("ROLLBACK");
+    console.error("DB保存失敗:", e.message);
+  } finally {
+    client.release();
+  }
+}
+
+// 0,4,8,12,16,20時にDBへ保存
+function scheduleSave() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setMinutes(0, 0, 0);
+  const h = now.getHours();
+  const nextH = [0,4,8,12,16,20].find(t => t > h) ?? 24;
+  next.setHours(nextH === 24 ? 0 : nextH);
+  if (nextH === 24) next.setDate(next.getDate() + 1);
+  const ms = next - now;
+  setTimeout(() => { saveToDB(); scheduleSave(); }, ms);
+  console.log(`次回DB保存: ${next.toLocaleString("ja-JP", {timeZone:"Asia/Tokyo"})}`);
+}
+
+// ----------------------
 // WebSocket ブロードキャスト
 // ----------------------
 // channel: 'chat' | 'battle'
@@ -268,7 +410,7 @@ app.get("/health", (req, res) => res.status(200).json({ status: "OK", timestamp:
 // ----------------------
 async function handleGet(table, topicKey, res, req) {
   try {
-    const limit  = Math.min(parseInt(req.query.limit  ?? "50"), 200); // 最大200件
+    const limit  = req.query.limit ? Math.min(parseInt(req.query.limit), 10000) : 10000;
     const after  = parseInt(req.query.after  ?? "0");   // このno以降（差分取得）
     const before = parseInt(req.query.before ?? "0");   // このnoより前（ページング）
 
