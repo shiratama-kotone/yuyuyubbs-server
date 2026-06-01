@@ -438,21 +438,8 @@ async function handleGet(table, topicKey, res, req) {
 
     const { rows: posts } = await pool.query(query, params);
 
-    // enrichを並列化（color・addを一括JOIN）
-    const enriched = await Promise.all(posts.map(async (p) => {
-      const [roleVal, colorResult, addResult] = await Promise.all([
-        getRole(p.id),
-        pool.query(`SELECT color_code FROM color WHERE id=$1`, [p.id]),
-        pool.query(`SELECT suffix FROM "add" WHERE id=$1`, [p.id]),
-      ]);
-      return {
-        ...p,
-        role:      roleVal,
-        colorCode: colorResult.rows[0]?.color_code ?? null,
-        addSuffix: addResult.rows[0]?.suffix ?? null,
-      };
-    }));
-
+const enriched = await enrichPosts(posts);
+    
     res.json({
       topic:       topicResult,
       posts:       enriched,
