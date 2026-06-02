@@ -33,28 +33,20 @@ const requestTimestamps = {};
 // インメモリストア
 // ----------------------
 const store = {
-  // 投稿: { chat: Map<no, post>, battle: Map<no, post> }
   posts:   { chat: new Map(), battle: new Map() },
-  // 権限: Set<id>
   roles:   { admin: new Set(), summit: new Set(), manager: new Set(), speaker: new Set() },
-  // 設定: Map<key, value>
   settings: new Map(),
-  // color/add: Map<id, value>
   color:   new Map(),
   add:     new Map(),
-  // ng/ban/kill: Set<word or id>
   ng:      new Set(),
   ban:     new Set(),
   kill:    new Set(),
-  // nextNo
   nextNo:  { chat: 3, battle: 1 },
 };
 
-// DBから全データをメモリに読み込む
 async function loadFromDB() {
   const client = await pool.connect();
   try {
-    // 投稿
     const { rows: chatPosts }   = await client.query(`SELECT * FROM posts ORDER BY no ASC`);
     const { rows: battlePosts } = await client.query(`SELECT * FROM battle_posts ORDER BY no ASC`);
     store.posts.chat.clear();
@@ -64,23 +56,19 @@ async function loadFromDB() {
     if (chatPosts.length)   store.nextNo.chat   = Math.max(...chatPosts.map(p => p.no))   + 1;
     if (battlePosts.length) store.nextNo.battle = Math.max(...battlePosts.map(p => p.no)) + 1;
 
-    // 権限
     for (const role of ["admin", "summit", "manager", "speaker"]) {
       const { rows } = await client.query(`SELECT id FROM ${role}`);
       store.roles[role] = new Set(rows.map(r => r.id));
     }
 
-    // 設定
     const { rows: settings } = await client.query(`SELECT key, value FROM settings`);
     settings.forEach(s => store.settings.set(s.key, s.value));
 
-    // color / add
     const { rows: colors } = await client.query(`SELECT id, color_code FROM color`);
     colors.forEach(c => store.color.set(c.id, c.color_code));
     const { rows: adds }   = await client.query(`SELECT id, suffix FROM "add"`);
     adds.forEach(a => store.add.set(a.id, a.suffix));
 
-    // ng / ban / kill
     const { rows: ngRows }   = await client.query(`SELECT word FROM ng_words`);
     const { rows: banRows }  = await client.query(`SELECT id FROM ban`);
     const { rows: killRows } = await client.query(`SELECT id FROM kill_list`);
@@ -94,13 +82,11 @@ async function loadFromDB() {
   }
 }
 
-// メモリの内容をDBへ書き戻す
 async function saveToDB() {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    // 投稿テーブルを全置換
     for (const [table, channel] of [["posts","chat"],["battle_posts","battle"]]) {
       await client.query(`DELETE FROM ${table}`);
       const posts = Array.from(store.posts[channel].values());
@@ -113,7 +99,6 @@ async function saveToDB() {
       }
     }
 
-    // 権限
     for (const role of ["admin","summit","manager","speaker"]) {
       await client.query(`DELETE FROM ${role}`);
       for (const id of store.roles[role]) {
@@ -121,7 +106,6 @@ async function saveToDB() {
       }
     }
 
-    // 設定
     for (const [key, value] of store.settings) {
       await client.query(
         `INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2`,
@@ -129,7 +113,6 @@ async function saveToDB() {
       );
     }
 
-    // color / add
     await client.query(`DELETE FROM color`);
     for (const [id, code] of store.color) {
       await client.query(`INSERT INTO color (id, color_code) VALUES ($1,$2)`, [id, code]);
@@ -139,7 +122,6 @@ async function saveToDB() {
       await client.query(`INSERT INTO "add" (id, suffix) VALUES ($1,$2)`, [id, suffix]);
     }
 
-    // ng / ban / kill
     await client.query(`DELETE FROM ng_words`);
     for (const w of store.ng)   await client.query(`INSERT INTO ng_words (word) VALUES ($1)`, [w]);
     await client.query(`DELETE FROM ban`);
@@ -157,7 +139,6 @@ async function saveToDB() {
   }
 }
 
-// 0,4,8,12,16,20時にDBへ保存
 function scheduleSave() {
   const now = new Date();
   const next = new Date(now);
@@ -174,13 +155,11 @@ function scheduleSave() {
 // ----------------------
 // WebSocket ブロードキャスト
 // ----------------------
-// channel: 'chat' | 'battle'
 function broadcast(channel, data) {
   const msg = JSON.stringify({ channel, ...data });
   wss.clients.forEach(client => {
     if (client.readyState === 1) client.send(msg);
   });
-  // Webhookへ送信（投稿イベントのみ）
   if (data.type === "post" && data.post) {
     const post = data.post;
     const payload = {
@@ -251,7 +230,6 @@ async function initDB() {
     await client.query(`CREATE TABLE IF NOT EXISTS ban       (id TEXT PRIMARY KEY)`);
     await client.query(`CREATE TABLE IF NOT EXISTS kill_list (id TEXT PRIMARY KEY)`);
 
-    // アカウント・Webhookテーブル
     await client.query(`
       CREATE TABLE IF NOT EXISTS accounts (
         username    TEXT PRIMARY KEY,
@@ -262,10 +240,8 @@ async function initDB() {
         created_at  TIMESTAMPTZ DEFAULT now()
       )
     `);
-    // カラム追加（既存DBへの対応）
     await client.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS api_key TEXT UNIQUE`);
     await client.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS dm_id TEXT`);
-    // dm_idがNULLの既存アカウントに9桁IDを割り当て
     await client.query(`
       UPDATE accounts SET dm_id = LPAD(FLOOR(RANDOM() * 1000000000)::TEXT, 9, '0')
       WHERE dm_id IS NULL
@@ -279,7 +255,6 @@ async function initDB() {
         created_at  TIMESTAMPTZ DEFAULT now()
       )
     `);
-    // DMテーブル
     await client.query(`
       CREATE TABLE IF NOT EXISTS dms (
         id          SERIAL PRIMARY KEY,
@@ -290,7 +265,6 @@ async function initDB() {
       )
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS dms_room_idx ON dms(room_id, time DESC)`);
-    // 地雷テーブル
     await client.query(`
       CREATE TABLE IF NOT EXISTS mines (
         id          SERIAL PRIMARY KEY,
@@ -301,7 +275,6 @@ async function initDB() {
       )
     `);
 
-    // 雑談シード投稿
     await client.query(`
       INSERT INTO posts (no, name, id, content, time) VALUES
         (0, 'さーばー', '( ᐛ )', 'ぜんけしー',   '0001/01/01 00:00'),
@@ -317,7 +290,6 @@ async function initDB() {
       )
     `);
 
-    // 起動通知（雑談のみ）
     const bootTime = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
     await client.query(
       `INSERT INTO posts (name, id, content, time) VALUES ('さーばー', '( ᐛ )', 'サーバーが再起動しました', $1)`,
@@ -406,15 +378,15 @@ app.get("/",       (req, res) => res.send("掲示板サーバーが正常に動�
 app.get("/health", (req, res) => res.status(200).json({ status: "OK", timestamp: new Date().toISOString() }));
 
 // ----------------------
-// 共通GET（ページネーション・差分取得対応）
+// 共通GET（全件取得・差分取得・ページネーション対応）
 // ----------------------
 async function handleGet(table, topicKey, res, req) {
   try {
-    const limit  = req.query.limit ? Math.min(parseInt(req.query.limit), 10000) : 10000;
-    const after  = parseInt(req.query.after  ?? "0");   // このno以降（差分取得）
-    const before = parseInt(req.query.before ?? "0");   // このnoより前（ページング）
+    // limitが指定されない場合は全件取得
+    const limit  = req.query.limit ? parseInt(req.query.limit) : null;
+    const after  = parseInt(req.query.after  ?? "0");
+    const before = parseInt(req.query.before ?? "0");
 
-    // topic・restriction・件数を並列取得
     const [topicResult, rsResult, countResult] = await Promise.all([
       getSetting(topicKey),
       getRestrictionStatus(),
@@ -423,29 +395,33 @@ async function handleGet(table, topicKey, res, req) {
 
     let query, params;
     if (after > 0) {
-      // 差分取得: afterより大きいnoの新着のみ
-      query  = `SELECT * FROM ${table} WHERE no > $1 ORDER BY no DESC LIMIT $2`;
-      params = [after, limit];
+      query  = limit
+        ? `SELECT * FROM ${table} WHERE no > $1 ORDER BY no DESC LIMIT $2`
+        : `SELECT * FROM ${table} WHERE no > $1 ORDER BY no DESC`;
+      params = limit ? [after, limit] : [after];
     } else if (before > 0) {
-      // ページング: beforeより小さいnoを取得
-      query  = `SELECT * FROM ${table} WHERE no < $1 ORDER BY no DESC LIMIT $2`;
-      params = [before, limit];
+      query  = limit
+        ? `SELECT * FROM ${table} WHERE no < $1 ORDER BY no DESC LIMIT $2`
+        : `SELECT * FROM ${table} WHERE no < $1 ORDER BY no DESC`;
+      params = limit ? [before, limit] : [before];
     } else {
-      // 初回取得
-      query  = `SELECT * FROM ${table} ORDER BY no DESC LIMIT $1`;
-      params = [limit];
+      query  = limit
+        ? `SELECT * FROM ${table} ORDER BY no DESC LIMIT $1`
+        : `SELECT * FROM ${table} ORDER BY no DESC`;
+      params = limit ? [limit] : [];
     }
 
     const { rows: posts } = await pool.query(query, params);
 
-const enriched = await enrichPosts(posts);
-    
+    // enrichPosts を使うことで verified・dm_id も含めて返す
+    const enriched = await enrichPosts(posts);
+
     res.json({
       topic:       topicResult,
       posts:       enriched,
       restriction: rsResult,
       total:       parseInt(countResult.rows[0].cnt),
-      hasMore:     before > 0 ? enriched.length === limit : false,
+      hasMore:     before > 0 && limit ? enriched.length === limit : false,
     });
   } catch (err) {
     console.error(err);
@@ -515,7 +491,6 @@ async function handlePost(table, topicKey, channel, req, res) {
       const colorMap = { blue: 0, darkorange: 1, red: 2, darkcyan: 3 };
       for (const target of targets) {
         if (colorMap[target] !== undefined) {
-          // 権限色で削除
           const tableMap = { 1: "speaker", 2: "manager", 3: "summit" };
           let ids = [];
           if (colorMap[target] === 0) {
@@ -534,7 +509,6 @@ async function handlePost(table, topicKey, channel, req, res) {
             );
           }
         } else {
-          // 文字列・ID・名前の部分一致で削除
           await pool.query(
             `UPDATE ${table} SET name='削除されました', content='削除されました', id='', deleted=TRUE
              WHERE content LIKE $1 OR id=$2 OR name LIKE $1`,
@@ -546,7 +520,7 @@ async function handlePost(table, topicKey, channel, req, res) {
       commandMessage = "/destroy";
     }
 
-    // /topic（複数行・最大10行）
+    // /topic
     const topicMatch = !commandMessage && content.match(/^\/topic(?:\s+|\n)([\s\S]+)$/);
     if (topicMatch) {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
@@ -754,7 +728,7 @@ async function handlePost(table, topicKey, channel, req, res) {
       return res.status(200).json({ message: "/seedsearch", seeds });
     }
 
-    // /mine 言葉 — 地雷設置
+    // /mine
     const mineMatch = !commandMessage && content.match(/^\/mine\s+(.+)$/);
     if (mineMatch) {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
@@ -766,7 +740,7 @@ async function handlePost(table, topicKey, channel, req, res) {
       commandMessage = "/mine";
     }
 
-    // /mineoff 言葉 — 地雷解除
+    // /mineoff
     const mineoffMatch = !commandMessage && content.match(/^\/mineoff\s+(.+)$/);
     if (mineoffMatch) {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
@@ -774,7 +748,7 @@ async function handlePost(table, topicKey, channel, req, res) {
       commandMessage = "/mineoff";
     }
 
-    // /mines — 地雷一覧
+    // /mines
     if (!commandMessage && content.trim() === "/mines") {
       if (role < 2) return res.status(403).json({ error: "権限不足 (マネージャー以上必要)" });
       const { rows: mineList } = await pool.query(`SELECT word FROM mines WHERE channel=$1`, [channel]);
@@ -816,7 +790,7 @@ async function handlePost(table, topicKey, channel, req, res) {
     const enrichedPost = (await enrichPosts([inserted[0]]))[0];
     broadcast(channel, { type: "post", post: enrichedPost });
 
-    // 地雷チェック（通常投稿のみ・0.05%の確率）
+    // 地雷チェック（0.05%の確率）
     if (!commandMessage && Math.random() < 0.0005) {
       const mineTime = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
       const { rows: minePost } = await pool.query(
@@ -874,8 +848,6 @@ app.get("/id", async (req, res) => {
 // ----------------------
 // 統計・ステータスAPI
 // ----------------------
-
-// サーバー統計
 app.get("/stats", async (req, res) => {
   try {
     const [chatCount, battleCount, onlineCount, ngCount] = await Promise.all([
@@ -911,7 +883,6 @@ app.get("/stats", async (req, res) => {
   }
 });
 
-// 投稿者ランキング（上位10件）
 app.get("/stats/top-posters", async (req, res) => {
   try {
     const ch = req.query.channel === "battle" ? "battle_posts" : "posts";
@@ -932,7 +903,6 @@ app.get("/stats/top-posters", async (req, res) => {
   }
 });
 
-// 規制状態
 app.get("/status", async (req, res) => {
   try {
     const [rs, topic, battleTopic, ngWords, banCount, killCount] = await Promise.all([
@@ -955,7 +925,6 @@ app.get("/status", async (req, res) => {
   }
 });
 
-// IDの情報を取得
 app.get("/user/:id", async (req, res) => {
   try {
     const id = req.params.id.startsWith("@") ? req.params.id : "@" + req.params.id;
@@ -1002,8 +971,6 @@ app.get("/seedsearch", async (req, res) => {
 // ----------------------
 // アカウント API
 // ----------------------
-
-// トークン認証ミドルウェア（Bearer or Cookie）
 async function requireAuth(req, res, next) {
   const auth = req.headers["authorization"] || "";
   const token = auth.replace(/^Bearer\s+/, "").trim()
@@ -1015,7 +982,6 @@ async function requireAuth(req, res, next) {
   next();
 }
 
-// APIキー認証ミドルウェア
 async function requireApiKey(req, res, next) {
   const key = req.headers["x-api-key"] || req.query.api_key || "";
   if (!key) return res.status(401).json({ error: "APIキーが必要です" });
@@ -1025,24 +991,21 @@ async function requireApiKey(req, res, next) {
   next();
 }
 
-// どちらかで認証
 async function requireAnyAuth(req, res, next) {
   const apiKey = req.headers["x-api-key"] || req.query.api_key || "";
   if (apiKey) return requireApiKey(req, res, next);
   return requireAuth(req, res, next);
 }
 
-// 9桁DM ID生成（重複チェック付き）
 async function generateDmId() {
   for (let i = 0; i < 10; i++) {
     const id = String(Math.floor(Math.random() * 1000000000)).padStart(9, "0");
     const { rows } = await pool.query(`SELECT 1 FROM accounts WHERE dm_id=$1`, [id]);
     if (!rows.length) return id;
   }
-  return String(Date.now()).slice(-9); // フォールバック
+  return String(Date.now()).slice(-9);
 }
 
-// アカウント作成
 app.post("/account/register", async (req, res) => {
   const { username, bbs_id, bbs_pass } = req.body;
   if (!username || !bbs_id || !bbs_pass)
@@ -1066,7 +1029,6 @@ app.post("/account/register", async (req, res) => {
   res.status(201).json({ message: "アカウントを作成しました", token, dm_id });
 });
 
-// ログイン（トークン再発行）
 app.post("/account/login", async (req, res) => {
   const { bbs_id, bbs_pass } = req.body;
   if (!bbs_id || !bbs_pass)
@@ -1084,20 +1046,17 @@ app.post("/account/login", async (req, res) => {
   res.json({ message: "ログイン成功", token, username: rows[0].username, dm_id: rows[0].dm_id });
 });
 
-// 自分の情報
 app.get("/account/me", requireAuth, (req, res) => {
   const { username, bbs_id, dm_id, api_key, created_at } = req.account;
   res.json({ username, bbs_id, dm_id, has_api_key: !!api_key, created_at });
 });
 
-// APIキー発行・再発行
 app.post("/account/apikey", requireAuth, async (req, res) => {
   const newKey = "bbs_" + crypto.randomBytes(24).toString("base64url");
   await pool.query(`UPDATE accounts SET api_key=$1 WHERE username=$2`, [newKey, req.account.username]);
   res.json({ api_key: newKey });
 });
 
-// APIキー取得（現在のキーを表示）
 app.get("/account/apikey", requireAuth, async (req, res) => {
   const { rows } = await pool.query(`SELECT api_key FROM accounts WHERE username=$1`, [req.account.username]);
   if (!rows[0]?.api_key) return res.status(404).json({ error: "APIキーが未発行です" });
@@ -1107,13 +1066,10 @@ app.get("/account/apikey", requireAuth, async (req, res) => {
 // ----------------------
 // DM API
 // ----------------------
-
-// DM room_id = 小さい方_大きい方 で一意
 function dmRoomId(a, b) {
   return [a, b].sort().join("_");
 }
 
-// DM送信可能なユーザー一覧（自分と会話したことがある or bbs_idで検索）
 app.get("/dm/users", requireAnyAuth, async (req, res) => {
   const q = req.query.q || "";
   let rows;
@@ -1124,7 +1080,6 @@ app.get("/dm/users", requireAnyAuth, async (req, res) => {
     );
     rows = result.rows;
   } else {
-    // 最近DMした相手一覧
     const myDmId = req.account.dm_id;
     const { rows: rooms } = await pool.query(
       `SELECT DISTINCT room_id FROM dms WHERE room_id LIKE $1 ORDER BY room_id`,
@@ -1141,11 +1096,9 @@ app.get("/dm/users", requireAnyAuth, async (req, res) => {
   res.json({ users: rows });
 });
 
-// DM履歴取得
 app.get("/dm/:dm_id", requireAnyAuth, async (req, res) => {
   const myDmId   = req.account.dm_id;
   const peerDmId = req.params.dm_id;
-  // 相手がアカウント存在確認
   const { rows: peer } = await pool.query(`SELECT username, bbs_id, dm_id FROM accounts WHERE dm_id=$1`, [peerDmId]);
   if (!peer.length) return res.status(404).json({ error: "ユーザーが見つかりません" });
 
@@ -1162,7 +1115,6 @@ app.get("/dm/:dm_id", requireAnyAuth, async (req, res) => {
   res.json({ room_id: roomId, peer: peer[0], messages: messages.reverse() });
 });
 
-// DM送信
 app.post("/dm/:dm_id", requireAnyAuth, async (req, res) => {
   const myDmId   = req.account.dm_id;
   const peerDmId = req.params.dm_id;
@@ -1179,7 +1131,6 @@ app.post("/dm/:dm_id", requireAnyAuth, async (req, res) => {
     [roomId, myDmId, content.trim()]
   );
 
-  // WebSocketでリアルタイム通知
   const msg = JSON.stringify({ type: "dm", room_id: roomId, message: inserted[0] });
   wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
 
@@ -1189,8 +1140,6 @@ app.post("/dm/:dm_id", requireAnyAuth, async (req, res) => {
 // ----------------------
 // Webhook API
 // ----------------------
-
-// Webhook一覧取得
 app.get("/webhooks", requireAuth, async (req, res) => {
   const { rows } = await pool.query(
     `SELECT id, url, channel, created_at FROM webhooks WHERE username=$1 ORDER BY id`,
@@ -1199,7 +1148,6 @@ app.get("/webhooks", requireAuth, async (req, res) => {
   res.json({ webhooks: rows });
 });
 
-// Webhook登録
 app.post("/webhooks", requireAuth, async (req, res) => {
   const { url, channel } = req.body;
   if (!url) return res.status(400).json({ error: "urlは必須" });
@@ -1220,7 +1168,6 @@ app.post("/webhooks", requireAuth, async (req, res) => {
   res.status(201).json({ webhook: rows[0] });
 });
 
-// Webhook削除
 app.delete("/webhooks/:id", requireAuth, async (req, res) => {
   const { rowCount } = await pool.query(
     `DELETE FROM webhooks WHERE id=$1 AND username=$2`,
@@ -1230,7 +1177,6 @@ app.delete("/webhooks/:id", requireAuth, async (req, res) => {
   res.json({ message: "削除しました" });
 });
 
-// Webhookテスト送信
 app.post("/webhooks/:id/test", requireAuth, async (req, res) => {
   const { rows } = await pool.query(
     `SELECT * FROM webhooks WHERE id=$1 AND username=$2`,
@@ -1318,7 +1264,7 @@ server.listen(PORT, "0.0.0.0", () => {
 });
 
 // ----------------------
-// 地震速報（P2P地震情報APIをポーリング）
+// 地震速報
 // ----------------------
 let lastEqId = null;
 
@@ -1342,7 +1288,6 @@ async function checkEarthquake() {
       dateStr = `${d.getFullYear()}年${pad(d.getMonth()+1)}月${pad(d.getDate())}日${pad(d.getHours())}時${pad(d.getMinutes())}分`;
     }
 
-    // 震度変換
     const scaleMap = { 10:"1", 20:"2", 30:"3", 40:"4", 45:"5弱", 50:"5強", 55:"6弱", 60:"6強", 70:"7" };
     const scaleStr = scaleMap[maxScale] ?? "不明";
 
@@ -1354,7 +1299,6 @@ async function checkEarthquake() {
     }
 
     const eqTime = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
-    // 雑談のみに送信
     const { rows: eqPost } = await pool.query(
       `INSERT INTO posts (name, content, id, time) VALUES ('地震速報', $1, '@EQALERT', $2) RETURNING *`,
       [msgContent, eqTime]
@@ -1367,9 +1311,7 @@ async function checkEarthquake() {
   }
 }
 
-// 1分ごとにチェック
 setInterval(checkEarthquake, 60 * 1000);
-// 起動時にも取得して lastEqId を初期化（重複送信防止）
 axios.get("https://api.p2pquake.net/v2/history?codes=551&limit=1", { timeout: 5000 })
   .then(r => { if (r.data && r.data.length) lastEqId = r.data[0].id; })
   .catch(() => {});
